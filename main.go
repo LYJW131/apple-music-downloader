@@ -18,6 +18,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"main/utils/ampapi"
@@ -991,6 +992,278 @@ func ripTrack(track *task.Track, token string, mediaUserToken string) {
 	okDict[track.PreID] = append(okDict[track.PreID], track.TaskNum)
 }
 
+// ripTrackWithMutex is a thread-safe version of ripTrack for parallel downloading
+func ripTrackWithMutex(track *task.Track, token string, mediaUserToken string, mu *sync.Mutex) {
+	var err error
+	mu.Lock()
+	counter.Total++
+	mu.Unlock()
+	fmt.Printf("Track %d of %d: %s\n", track.TaskNum, track.TaskTotal, track.Type)
+
+	//提前获取到的播放列表下track所在的专辑信息
+	if track.PreType == "playlists" && Config.UseSongInfoForPlaylist {
+		track.GetAlbumData(token)
+	}
+
+	//mv dl dev
+	if track.Type == "music-videos" {
+		if len(mediaUserToken) <= 50 {
+			fmt.Println("meida-user-token is not set, skip MV dl")
+			mu.Lock()
+			counter.Success++
+			mu.Unlock()
+			return
+		}
+		if _, err := exec.LookPath("mp4decrypt"); err != nil {
+			fmt.Println("mp4decrypt is not found, skip MV dl")
+			mu.Lock()
+			counter.Success++
+			mu.Unlock()
+			return
+		}
+		err := mvDownloader(track.ID, track.SaveDir, token, track.Storefront, mediaUserToken, track)
+		if err != nil {
+			fmt.Println("\u26A0 Failed to dl MV:", err)
+			mu.Lock()
+			counter.Error++
+			mu.Unlock()
+			return
+		}
+		mu.Lock()
+		counter.Success++
+		mu.Unlock()
+		return
+	}
+
+	needDlAacLc := false
+	if dl_aac && Config.AacType == "aac-lc" {
+		needDlAacLc = true
+	}
+	if track.WebM3u8 == "" && !needDlAacLc {
+		if dl_atmos {
+			fmt.Println("Unavailable")
+			mu.Lock()
+			counter.Unavailable++
+			mu.Unlock()
+			return
+		}
+		fmt.Println("Unavailable, trying to dl aac-lc")
+		needDlAacLc = true
+	}
+	needCheck := false
+
+	if Config.GetM3u8Mode == "all" {
+		needCheck = true
+	} else if Config.GetM3u8Mode == "hires" && contains(track.Resp.Attributes.AudioTraits, "hi-res-lossless") {
+		needCheck = true
+	}
+	var EnhancedHls_m3u8 string
+	if needCheck && !needDlAacLc {
+		EnhancedHls_m3u8, _ = checkM3u8(track.ID, "song")
+		if strings.HasSuffix(EnhancedHls_m3u8, ".m3u8") {
+			track.DeviceM3u8 = EnhancedHls_m3u8
+			track.M3u8 = EnhancedHls_m3u8
+		}
+	}
+	var Quality string
+	if strings.Contains(Config.SongFileFormat, "Quality") {
+		if dl_atmos {
+			Quality = fmt.Sprintf("%dKbps", Config.AtmosMax-2000)
+		} else if needDlAacLc {
+			Quality = "256Kbps"
+		} else {
+			_, Quality, err = extractMedia(track.M3u8, true)
+			if err != nil {
+				fmt.Println("Failed to extract quality from manifest.\n", err)
+				mu.Lock()
+				counter.Error++
+				mu.Unlock()
+				return
+			}
+		}
+	}
+	track.Quality = Quality
+
+	stringsToJoin := []string{}
+	if track.Resp.Attributes.IsAppleDigitalMaster {
+		if Config.AppleMasterChoice != "" {
+			stringsToJoin = append(stringsToJoin, Config.AppleMasterChoice)
+		}
+	}
+	if track.Resp.Attributes.ContentRating == "explicit" {
+		if Config.ExplicitChoice != "" {
+			stringsToJoin = append(stringsToJoin, Config.ExplicitChoice)
+		}
+	}
+	if track.Resp.Attributes.ContentRating == "clean" {
+		if Config.CleanChoice != "" {
+			stringsToJoin = append(stringsToJoin, Config.CleanChoice)
+		}
+	}
+	Tag_string := strings.Join(stringsToJoin, " ")
+
+	songName := strings.NewReplacer(
+		"{SongId}", track.ID,
+		"{SongNumer}", fmt.Sprintf("%02d", track.TaskNum),
+		"{SongName}", LimitString(track.Resp.Attributes.Name),
+		"{DiscNumber}", fmt.Sprintf("%0d", track.Resp.Attributes.DiscNumber),
+		"{TrackNumber}", fmt.Sprintf("%0d", track.Resp.Attributes.TrackNumber),
+		"{Quality}", Quality,
+		"{Tag}", Tag_string,
+		"{Codec}", track.Codec,
+	).Replace(Config.SongFileFormat)
+	fmt.Println(songName)
+	filename := fmt.Sprintf("%s.m4a", forbiddenNames.ReplaceAllString(songName, "_"))
+	track.SaveName = filename
+	trackPath := filepath.Join(track.SaveDir, track.SaveName)
+	lrcFilename := fmt.Sprintf("%s.%s", forbiddenNames.ReplaceAllString(songName, "_"), Config.LrcFormat)
+
+	// Determine possible post-conversion target file (so we can skip re-download)
+	var convertedPath string
+	considerConverted := false
+	if Config.ConvertAfterDownload &&
+		Config.ConvertFormat != "" &&
+		strings.ToLower(Config.ConvertFormat) != "copy" &&
+		!Config.ConvertKeepOriginal {
+		convertedPath = strings.TrimSuffix(trackPath, filepath.Ext(trackPath)) + "." + strings.ToLower(Config.ConvertFormat)
+		considerConverted = true
+	}
+	//get lrc
+	var lrc string = ""
+	if Config.EmbedLrc || Config.SaveLrcFile {
+		lrcStr, err := lyrics.Get(track.Storefront, track.ID, Config.LrcType, Config.Language, Config.LrcFormat, token, mediaUserToken)
+		if err != nil {
+			fmt.Println(err)
+		} else {
+			if Config.SaveLrcFile {
+				err := writeLyrics(track.SaveDir, lrcFilename, lrcStr)
+				if err != nil {
+					fmt.Printf("Failed to write lyrics")
+				}
+			}
+			if Config.EmbedLrc {
+				lrc = lrcStr
+			}
+		}
+	}
+
+	// Existence check now considers converted output (if original was deleted)
+	existsOriginal, err := fileExists(trackPath)
+	if err != nil {
+		fmt.Println("Failed to check if track exists.")
+	}
+	if existsOriginal {
+		fmt.Println("Track already exists locally.")
+		mu.Lock()
+		counter.Success++
+		okDict[track.PreID] = append(okDict[track.PreID], track.TaskNum)
+		mu.Unlock()
+		return
+	}
+	if considerConverted {
+		existsConverted, err2 := fileExists(convertedPath)
+		if err2 == nil && existsConverted {
+			fmt.Println("Converted track already exists locally.")
+			mu.Lock()
+			counter.Success++
+			okDict[track.PreID] = append(okDict[track.PreID], track.TaskNum)
+			mu.Unlock()
+			return
+		}
+	}
+
+	if needDlAacLc {
+		if len(mediaUserToken) <= 50 {
+			fmt.Println("Invalid media-user-token")
+			mu.Lock()
+			counter.Error++
+			mu.Unlock()
+			return
+		}
+		_, err := runv3.Run(track.ID, trackPath, token, mediaUserToken, false, "")
+		if err != nil {
+			fmt.Println("Failed to dl aac-lc:", err)
+			if err.Error() == "Unavailable" {
+				mu.Lock()
+				counter.Unavailable++
+				mu.Unlock()
+				return
+			}
+			mu.Lock()
+			counter.Error++
+			mu.Unlock()
+			return
+		}
+	} else {
+		trackM3u8Url, _, err := extractMedia(track.M3u8, false)
+		if err != nil {
+			fmt.Println("\u26A0 Failed to extract info from manifest:", err)
+			mu.Lock()
+			counter.Unavailable++
+			mu.Unlock()
+			return
+		}
+		//边下载边解密
+		err = runv2.Run(track.ID, trackM3u8Url, trackPath, Config)
+		if err != nil {
+			fmt.Println("Failed to run v2:", err)
+			mu.Lock()
+			counter.Error++
+			mu.Unlock()
+			return
+		}
+	}
+	//这里利用MP4box将fmp4转化为mp4，并添加ilst box与cover，方便后面的mp4tag添加更多自定义标签
+	tags := []string{
+		"tool=",
+		"artist=AppleMusic",
+	}
+	if Config.EmbedCover {
+		if (strings.Contains(track.PreID, "pl.") || strings.Contains(track.PreID, "ra.")) && Config.DlAlbumcoverForPlaylist {
+			track.CoverPath, err = writeCover(track.SaveDir, track.ID, track.Resp.Attributes.Artwork.URL)
+			if err != nil {
+				fmt.Println("Failed to write cover.")
+			}
+		}
+		tags = append(tags, fmt.Sprintf("cover=%s", track.CoverPath))
+	}
+	tagsString := strings.Join(tags, ":")
+	cmd := exec.Command("MP4Box", "-itags", tagsString, trackPath)
+	if err := cmd.Run(); err != nil {
+		fmt.Printf("Embed failed: %v\n", err)
+		mu.Lock()
+		counter.Error++
+		mu.Unlock()
+		return
+	}
+	if (strings.Contains(track.PreID, "pl.") || strings.Contains(track.PreID, "ra.")) && Config.DlAlbumcoverForPlaylist {
+		if err := os.Remove(track.CoverPath); err != nil {
+			fmt.Printf("Error deleting file: %s\n", track.CoverPath)
+			mu.Lock()
+			counter.Error++
+			mu.Unlock()
+			return
+		}
+	}
+	track.SavePath = trackPath
+	err = writeMP4Tags(track, lrc)
+	if err != nil {
+		fmt.Println("\u26A0 Failed to write tags in media:", err)
+		mu.Lock()
+		counter.Unavailable++
+		mu.Unlock()
+		return
+	}
+
+	// CONVERSION FEATURE hook
+	convertIfNeeded(track)
+
+	mu.Lock()
+	counter.Success++
+	okDict[track.PreID] = append(okDict[track.PreID], track.TaskNum)
+	mu.Unlock()
+}
+
 func ripStation(albumId string, token string, storefront string, mediaUserToken string) error {
 	station := task.NewStation(storefront, albumId)
 	err := station.GetResp(mediaUserToken, token, Config.Language)
@@ -1166,12 +1439,35 @@ func ripStation(albumId string, token string, storefront string, mediaUserToken 
 	if true {
 		selected = arr
 	}
+
+	// Parallel download implementation
+	maxConcurrent := Config.MaxConcurrentDownloads
+	if maxConcurrent <= 0 {
+		maxConcurrent = 3
+	}
+	if maxConcurrent > 10 {
+		maxConcurrent = 10
+	}
+
+	sem := make(chan struct{}, maxConcurrent)
+	var wg sync.WaitGroup
+	var mu sync.Mutex
+
 	for i := range station.Tracks {
-		i++
-		if isInArray(selected, i) {
-			ripTrack(&station.Tracks[i-1], token, mediaUserToken)
+		idx := i + 1
+		if isInArray(selected, idx) {
+			wg.Add(1)
+			go func(trackIndex int) {
+				defer wg.Done()
+				sem <- struct{}{}
+				defer func() { <-sem }()
+
+				ripTrackWithMutex(&station.Tracks[trackIndex], token, mediaUserToken, &mu)
+			}(i)
 		}
 	}
+
+	wg.Wait()
 	return nil
 }
 
@@ -1341,7 +1637,7 @@ func ripAlbum(albumId string, token string, storefront string, mediaUserToken st
 	os.MkdirAll(albumFolderPath, os.ModePerm)
 	album.SaveName = albumFolderName
 	fmt.Println(albumFolderName)
-	if Config.SaveArtistCover && len(meta.Data[0].Relationships.Artists.Data) > 0{
+	if Config.SaveArtistCover && len(meta.Data[0].Relationships.Artists.Data) > 0 {
 		if meta.Data[0].Relationships.Artists.Data[0].Attributes.Artwork.Url != "" {
 			_, err = writeCover(singerFolder, "folder", meta.Data[0].Relationships.Artists.Data[0].Attributes.Artwork.Url)
 			if err != nil {
@@ -1434,17 +1730,42 @@ func ripAlbum(albumId string, token string, storefront string, mediaUserToken st
 	} else {
 		selected = album.ShowSelect()
 	}
+
+	// Parallel download implementation
+	maxConcurrent := Config.MaxConcurrentDownloads
+	if maxConcurrent <= 0 {
+		maxConcurrent = 3 // default value
+	}
+	if maxConcurrent > 10 {
+		maxConcurrent = 10 // limit to avoid API rate limiting
+	}
+
+	sem := make(chan struct{}, maxConcurrent)
+	var wg sync.WaitGroup
+	var mu sync.Mutex
+
 	for i := range album.Tracks {
-		i++
-		if isInArray(okDict[albumId], i) {
+		idx := i + 1
+		if isInArray(okDict[albumId], idx) {
+			mu.Lock()
 			counter.Total++
 			counter.Success++
+			mu.Unlock()
 			continue
 		}
-		if isInArray(selected, i) {
-			ripTrack(&album.Tracks[i-1], token, mediaUserToken)
+		if isInArray(selected, idx) {
+			wg.Add(1)
+			go func(trackIndex int) {
+				defer wg.Done()
+				sem <- struct{}{}        // acquire semaphore
+				defer func() { <-sem }() // release semaphore
+
+				ripTrackWithMutex(&album.Tracks[trackIndex], token, mediaUserToken, &mu)
+			}(i)
 		}
 	}
+
+	wg.Wait() // wait for all downloads to complete
 	return nil
 
 }
@@ -1675,17 +1996,42 @@ func ripPlaylist(playlistId string, token string, storefront string, mediaUserTo
 	} else {
 		selected = playlist.ShowSelect()
 	}
+
+	// Parallel download implementation
+	maxConcurrent := Config.MaxConcurrentDownloads
+	if maxConcurrent <= 0 {
+		maxConcurrent = 3
+	}
+	if maxConcurrent > 10 {
+		maxConcurrent = 10
+	}
+
+	sem := make(chan struct{}, maxConcurrent)
+	var wg sync.WaitGroup
+	var mu sync.Mutex
+
 	for i := range playlist.Tracks {
-		i++
-		if isInArray(okDict[playlistId], i) {
+		idx := i + 1
+		if isInArray(okDict[playlistId], idx) {
+			mu.Lock()
 			counter.Total++
 			counter.Success++
+			mu.Unlock()
 			continue
 		}
-		if isInArray(selected, i) {
-			ripTrack(&playlist.Tracks[i-1], token, mediaUserToken)
+		if isInArray(selected, idx) {
+			wg.Add(1)
+			go func(trackIndex int) {
+				defer wg.Done()
+				sem <- struct{}{}
+				defer func() { <-sem }()
+
+				ripTrackWithMutex(&playlist.Tracks[trackIndex], token, mediaUserToken, &mu)
+			}(i)
 		}
 	}
+
+	wg.Wait()
 	return nil
 }
 
